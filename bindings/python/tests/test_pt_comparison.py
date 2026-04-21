@@ -236,6 +236,25 @@ class TorchTestCase(unittest.TestCase):
         reloaded = load(binary)
         self.assertTrue(torch.equal(data["test"], reloaded["test"]))
 
+    @unittest.skipIf(
+        not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+        "MPS is not available",
+    )
+    def test_mps_with_device_index(self):
+        # Regression: load_file(..., device="mps:0") used to error out with
+        # "device mps:0 is invalid" because the Rust device parser only
+        # accepted bare "mps". torch itself accepts "mps:0" (via
+        # torch.device("mps:0")), so safetensors should too
+        data = {"test": torch.arange(4, dtype=torch.float32).view(2, 2)}
+        local = "./tests/data/out_safe_pt_mmap_small_mps_idx.safetensors"
+        save_file(data, local)
+        reloaded = load_file(local, device="mps:0")
+        self.assertEqual(reloaded["test"].device.type, "mps")
+        self.assertTrue(torch.equal(data["test"].to("mps"), reloaded["test"]))
+
+        with self.assertRaises(Exception):
+            load_file(local, device="mps:1")
+
     @unittest.skipIf(not torch.cuda.is_available(), "Cuda is not available")
     def test_gpu(self):
         data = {

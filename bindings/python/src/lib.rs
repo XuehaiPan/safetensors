@@ -439,6 +439,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Device {
                 "hpu" => Ok(Device::Hpu(0)),
                 name if name.starts_with("cuda:") => parse_device(name).map(Device::Cuda),
                 name if name.starts_with("musa:") => parse_device(name).map(Device::Musa),
+                name if name.starts_with("mps:") => match parse_device(name)? {
+                    0 => Ok(Device::Mps),
+                    _ => Err(SafetensorError::new_err(format!(
+                        "device {name} is invalid: only mps or mps:0 is supported"
+                    ))),
+                },
                 name if name.starts_with("npu:") => parse_device(name).map(Device::Npu),
                 name if name.starts_with("xpu:") => parse_device(name).map(Device::Xpu),
                 name if name.starts_with("xla:") => parse_device(name).map(Device::Xla),
