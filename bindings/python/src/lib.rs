@@ -27,6 +27,9 @@ static FLAX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static MLX_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 static PADDLE_MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
 
+#[cfg(target_os = "macos")]
+static MPS_HOST_ALIAS_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
 /// Describes a single tensor passed to [`serialize`] / [`serialize_file`].
 ///
 /// Constructed from Python as `TensorSpec(dtype, shape, data_ptr, data_len)`.
@@ -542,6 +545,8 @@ impl Version {
 }
 
 struct Open {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    filename: PathBuf,
     metadata: Metadata,
     offset: usize,
     framework: Framework,
@@ -689,6 +694,7 @@ impl Open {
         let storage = Arc::new(storage);
 
         Ok(Self {
+            filename,
             metadata,
             offset,
             framework,
@@ -942,6 +948,189 @@ impl Open {
         }
     }
 
+    /// Returns every tensor in the file as a `{name: Tensor}` dict.
+    ///
+    /// Default behavior is a sequential loop over `get_tensor`; specific
+    /// framework/device combinations can take an internal fast path (e.g.
+    /// MPS with `torch.mps._host_alias_storage` allocates all tensors
+    /// on-device and fills them with parallel `pread(2)` calls).
+    pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
+        #[cfg(target_os = "macos")]
+        if self.framework == Framework::Pytorch
+            && self.device == Device::Mps
+            && mps_host_alias_available()?
+        {
+            return self.get_tensors_mps_fast();
+        }
+
+        Python::attach(|py| -> PyResult<Py<PyDict>> {
+            let dict = PyDict::new(py);
+            for name in self.metadata.offset_keys() {
+                let tensor = self.get_tensor(&name)?;
+                dict.set_item(&name, tensor)?;
+            }
+            Ok(dict.into())
+        })
+    }
+
+    /// Bulk-allocates MPS tensors, then parallel-`pread`s straight into
+    /// their host-aliased MTLBuffers. Requires `torch.mps._host_alias_storage`
+    /// (pytorch/pytorch#180961); caller must have verified.
+    #[cfg(target_os = "macos")]
+    fn get_tensors_mps_fast(&self) -> PyResult<Py<PyDict>> {
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Only populated for non-empty tensors; zero-byte tensors are
+        // allocated as torch.empty and skipped entirely
+        struct Job {
+            name: String,
+            file_offset: u64,
+            nbytes: usize,
+            // Host-writable MTLBuffer pointer
+            write_ptr: usize,
+        }
+
+        let file = File::open(&self.filename).map_err(|e| {
+            PyFileNotFoundError::new_err(format!("Could not open {}: {e}", self.filename.display()))
+        })?;
+
+        Python::attach(|py| -> PyResult<Py<PyDict>> {
+            let torch = get_module(py, &TORCH_MODULE)?;
+            let mps_mod = torch.getattr(intern!(py, "mps"))?;
+            let host_alias_fn = mps_mod.getattr(intern!(py, "_host_alias_storage"))?;
+            let mps_device: Py<PyAny> = "mps".into_pyobject(py)?.into();
+
+            let keys = self.metadata.offset_keys();
+            let mut entries: Vec<(String, PyBound<'_, PyAny>)> = Vec::with_capacity(keys.len());
+            // Aliases pin the source MPS storages; keep alive across parallel writes.
+            let mut host_aliases: Vec<PyBound<'_, PyAny>> = Vec::with_capacity(keys.len());
+            let mut jobs: Vec<Job> = Vec::with_capacity(keys.len());
+
+            for name in keys {
+                let info = self.metadata.info(&name).ok_or_else(|| {
+                    SafetensorError::new_err(format!("Missing tensor info for {name}"))
+                })?;
+                let dtype_obj: Py<PyAny> = get_pydtype(torch, info.dtype, false)?;
+
+                // F4 stores two elements per byte; torch shape halves the last dim.
+                let mut torch_shape = info.shape.clone();
+                if info.dtype == Dtype::F4 {
+                    let n = torch_shape.len();
+                    if n == 0 || torch_shape[n - 1] % 2 != 0 {
+                        return Err(SafetensorError::new_err(format!(
+                            "f4_x2 dtype requires the last dim be divisible by 2 in torch: got {:?}",
+                            info.shape,
+                        )));
+                    }
+                    torch_shape[n - 1] /= 2;
+                }
+                let shape_obj: Py<PyAny> = torch_shape.into_pyobject(py)?.into();
+
+                let kwargs = [
+                    (intern!(py, "dtype"), dtype_obj),
+                    (intern!(py, "device"), mps_device.clone_ref(py)),
+                ]
+                .into_py_dict(py)?;
+                let tensor = torch.call_method("empty", (shape_obj,), Some(&kwargs))?;
+
+                let (begin, end) = info.data_offsets;
+                let nbytes = end - begin;
+
+                if nbytes > 0 {
+                    let mps_storage = tensor.call_method0(intern!(py, "untyped_storage"))?;
+                    let cpu_alias = host_alias_fn.call1((mps_storage,))?;
+                    let write_ptr: usize =
+                        cpu_alias.call_method0(intern!(py, "data_ptr"))?.extract()?;
+                    if write_ptr == 0 {
+                        return Err(SafetensorError::new_err(format!(
+                            "torch.mps._host_alias_storage returned a null data_ptr for tensor \
+                             {name} (non-shared-storage MPS allocation?)",
+                        )));
+                    }
+                    host_aliases.push(cpu_alias);
+                    jobs.push(Job {
+                        name: name.clone(),
+                        file_offset: (self.offset + begin) as u64,
+                        nbytes,
+                        write_ptr,
+                    });
+                }
+                entries.push((name, tensor));
+            }
+
+            // Drain in-flight GPU work before writing through the CPU alias.
+            mps_mod.call_method0(intern!(py, "synchronize"))?;
+
+            let read_result: Result<(), (String, std::io::Error)> = py.detach(|| {
+                let jobs = &jobs;
+                let file = &file;
+                let next = AtomicUsize::new(0);
+                // Cap: beyond P-core count reads are SSD-bound on Apple silicon.
+                const MAX_WORKERS: usize = 8;
+                let n_workers = std::thread::available_parallelism()
+                    .map_or(4, |n| n.get())
+                    .min(MAX_WORKERS)
+                    .min(jobs.len());
+
+                std::thread::scope(|s| -> Result<(), (String, std::io::Error)> {
+                    let mut handles = Vec::with_capacity(n_workers);
+                    for _ in 0..n_workers {
+                        let next = &next;
+                        handles.push(s.spawn(move || -> Result<(), (String, std::io::Error)> {
+                            loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                if i >= jobs.len() {
+                                    return Ok(());
+                                }
+                                let job = &jobs[i];
+                                // SAFETY: each job's (write_ptr, nbytes) comes from a
+                                // distinct torch.empty allocation on MPS, so the target
+                                // ranges are disjoint; the tensors outlive py.detach.
+                                let buf = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        job.write_ptr as *mut u8,
+                                        job.nbytes,
+                                    )
+                                };
+                                file.read_exact_at(buf, job.file_offset)
+                                    .map_err(|e| (job.name.clone(), e))?;
+                            }
+                        }));
+                    }
+                    for h in handles {
+                        h.join().map_err(|_| {
+                            (
+                                "<worker panic>".to_string(),
+                                std::io::Error::other("worker panicked"),
+                            )
+                        })??;
+                    }
+                    Ok(())
+                })
+            });
+
+            if let Err((name, e)) = read_result {
+                return Err(SafetensorError::new_err(format!(
+                    "pread failed for tensor {name}: {e}"
+                )));
+            }
+
+            // Make CPU writes visible to subsequent GPU reads.
+            mps_mod.call_method0(intern!(py, "synchronize"))?;
+
+            let result = PyDict::new(py);
+            for (name, tensor) in entries {
+                result.set_item(name, tensor)?;
+            }
+
+            // Drop aliases after synchronize so pinned MPS storages outlive writes.
+            drop(host_aliases);
+
+            Ok(result.into())
+        })
+    }
+
     /// Returns a full slice view object
     ///
     /// Args:
@@ -1058,6 +1247,29 @@ impl safe_open {
     /// ```
     pub fn get_tensor(&self, name: &str) -> PyResult<Py<PyAny>> {
         self.inner()?.get_tensor(name)
+    }
+
+    /// Returns every tensor in the file as a dict keyed by name.
+    ///
+    /// Equivalent to iterating `offset_keys()` and calling `get_tensor` on
+    /// each, but specific `framework` + `device` combinations take an
+    /// internal fast path (e.g. MPS with PyTorch ≥ 2.10's
+    /// `_host_alias_storage` bulk-allocates and fills tensors with parallel
+    /// `pread(2)`).
+    ///
+    /// Returns:
+    ///     (`Dict[str, Tensor]`):
+    ///         A dict of all tensors in the file.
+    ///
+    /// Example:
+    /// ```python
+    /// from safetensors import safe_open
+    ///
+    /// with safe_open("model.safetensors", framework="pt", device="mps") as f:
+    ///     state_dict = f.get_tensors()
+    /// ```
+    pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
+        self.inner()?.get_tensors()
     }
 
     /// Returns a full slice view object
@@ -1410,6 +1622,25 @@ fn get_module<'a>(
     Ok(module)
 }
 
+/// Whether this torch build exposes `torch.mps._host_alias_storage`
+/// (pytorch/pytorch#180961). Cached after the first call since the answer
+/// doesn't change at runtime. Torch must already be imported
+/// (guaranteed when `Open::new` ran with `Framework::Pytorch`).
+#[cfg(target_os = "macos")]
+fn mps_host_alias_available() -> PyResult<bool> {
+    if let Some(&cached) = MPS_HOST_ALIAS_AVAILABLE.get() {
+        return Ok(cached);
+    }
+    let available = Python::attach(|py| -> PyResult<bool> {
+        let torch = get_module(py, &TORCH_MODULE)?;
+        torch
+            .getattr(intern!(py, "mps"))?
+            .hasattr(intern!(py, "_host_alias_storage"))
+    })?;
+    let _ = MPS_HOST_ALIAS_AVAILABLE.set(available);
+    Ok(available)
+}
+
 fn create_tensor<'a>(
     framework: &'a Framework,
     dtype: Dtype,
@@ -1680,6 +1911,13 @@ impl _safe_open_handle {
     /// ```
     pub fn get_tensor(&self, name: &str) -> PyResult<Py<PyAny>> {
         self.inner()?.get_tensor(name)
+    }
+
+    /// Returns every tensor in the file as a dict keyed by name.
+    ///
+    /// See `safe_open.get_tensors` for the fast-path behavior.
+    pub fn get_tensors(&self) -> PyResult<Py<PyDict>> {
+        self.inner()?.get_tensors()
     }
 
     /// Returns a full slice view object
